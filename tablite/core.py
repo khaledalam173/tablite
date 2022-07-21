@@ -36,34 +36,36 @@ def exiting():
 import atexit
 atexit.register(exiting)
 
-
-from tablite.memory_manager import MemoryManager, Page, Pages
+from tablite import memory_manager as mem
+from tablite.memory_manager import Page, Pages
 from tablite.file_reader_utils import TextEscape, get_headers
 from tablite.utils import summary_statistics, unique_name
 from tablite import sortation
 from tablite.groupby_utils import GroupBy, GroupbyFunction
-from tablite.config import SINGLE_PROCESSING_LIMIT, TEMPDIR, H5_ENCODING
+from tablite.config import SINGLE_PROCESSING_LIMIT, TEMPDIR, H5_ENCODING, H5_STORAGE
 from tablite.datatypes import DataTypes
 
 
-mem = MemoryManager()
-
 class Table(object):
     
-    def __init__(self,key=None, save=False, _create=True, config=None) -> None:
+    def __init__(self,key=None, save=False, _create=True, config=None, path=H5_STORAGE) -> None:
+        self.path = mem.check_path(path)
+
         if key is None:
-            key = mem.new_id('/table')
+            key = mem.new_id(self.path, '/table')
         elif not isinstance(key, str):
-            raise TypeError
+            raise TypeError()
+
         self.key = key
 
-        self.group = f"/table/{self.key}"
         self._columns = {}  # references for virtual datasets that behave like lists.
         if _create:
             if config is not None:
                 if not isinstance(config, str):
                     raise TypeError("expected config as utf-8 encoded json")
-            mem.create_table(key=key, save=save, config=config)  # attrs. 'columns'
+
+            mem.create_table(self.path, key=key, save=save, config=config)  # attrs. 'columns'
+
         self._saved = save
     
     @property
@@ -76,7 +78,9 @@ class Table(object):
             raise TypeError(f'expected bool, got: {type(value)}')
         if self._saved != value:
             self._saved = value
-            mem.set_saved_flag(self.group, value)
+            mem.set_saved_flag(self.path, self.key, value)
+        if self._saved:
+            log.info(f"{self} saved in {self.path}")
 
     def __del__(self):
         if PYTHON_EXIT:
@@ -85,7 +89,7 @@ class Table(object):
         try:
             for key in list(self._columns):
                 del self[key]
-            mem.delete_table(self.group)
+            mem.delete_table(self.path, self.key)
         except KeyError:
             log.info("Table.__del__ suppressed.")
         
@@ -126,12 +130,12 @@ class Table(object):
         if isinstance(keys, str): 
             if isinstance(values, (tuple,list,np.ndarray)):
                 self._columns[keys] = column = Column(values)  # overwrite if exists.
-                mem.create_column_reference(self.key, column_name=keys, column_key=column.key)
+                mem.create_column_reference(self.path, self.key, column_name=keys, column_key=column.key)
             elif isinstance(values, Column):
                 col = self._columns.get(keys,None)
                 if col is None:  # it's a column from another table.
                     self._columns[keys] = column = values.copy()
-                    mem.create_column_reference(self.key, column_name=keys, column_key=column.key)
+                    mem.create_column_reference(self.path, self.key, column_name=keys, column_key=column.key)
                 elif values.key == col.key:  # it's update from += or similar
                     self._columns[keys] = values
                 else:                    
@@ -191,7 +195,7 @@ class Table(object):
         """
         if isinstance(key, str) and key in self._columns:
             col = self._columns[key]
-            mem.delete_column_reference(self.group, key, col.key)
+            mem.delete_column_reference(self.path, self.key, column_name=key, column_key=col.key)
             del self._columns[key]  # dereference the Column
         elif isinstance(key, slice):
             for col in self._columns.values():
@@ -267,7 +271,7 @@ class Table(object):
         return self
 
     @classmethod
-    def reload_saved_tables(cls,path=None):
+    def reload_saved_tables(cls,path=H5_STORAGE):
         """
         Loads saved tables from a hdf5 storage.
         
@@ -278,9 +282,8 @@ class Table(object):
         To import without changing the default location use:
         tables = reload_saved_tables("c:/another/location.hdf5)
         """
+        mem.check_path(path)
         tables = []
-        if path is None:
-            path = mem.path
         unsaved = 0
         with h5py.File(path, 'r+') as h5:
             if "/table" not in h5.keys():
@@ -303,7 +306,7 @@ class Table(object):
             group = f"/table/{key}"
             dset = h5[group]
             saved = dset.attrs['saved']
-            t = Table(key=key, save=saved, _create=False)
+            t = Table(key=key, save=saved, _create=False, path=path)
             columns = json.loads(dset.attrs['columns'])
             for col_name, column_key in columns.items():
                 c = Column.load(key=column_key)
@@ -601,12 +604,12 @@ class Table(object):
     @classmethod
     def import_file(cls, path,  import_as, 
         newline='\n', text_qualifier=None,  delimiter=',', first_row_has_headers=True, columns=None, sheet=None, 
-        start=0, limit=sys.maxsize, strip_leading_and_tailing_whitespace=True, encoding=None):
+        start=0, limit=sys.maxsize, strip_leading_and_tailing_whitespace=True, encoding=None):  # TODO - update docstring. import_as is incorrect.
         """
         reads path and imports 1 or more tables as hdf5
 
         path: pathlib.Path or str
-        import_as: 'csv','xlsx','txt'                               *123
+        import_as: 'csv','xls','txt'                                *123
         newline: newline character '\n', '\r\n' or b'\n', b'\r\n'   *13
         text_qualifier: character: " or '                           +13
         delimiter: character: typically ",", ";" or "|"             *1+3
@@ -675,12 +678,12 @@ class Table(object):
             'encoding': encoding
         }
         jsn_str = json.dumps(config)
-        for table_key, jsnb in mem.get_imported_tables().items():
+        for table_key, jsnb in mem.get_imported_tables(path=H5_STORAGE).items():
             if jsn_str == jsnb:
-                return Table.load(mem.path, table_key)  # table already imported.
+                return Table.load(path=H5_STORAGE, key=table_key)  # table already imported.
         # not returned yet? Then it's an import job:
         t = reader(**config)
-        mem.set_config(t.group, jsn_str)
+        mem.set_config(path=H5_STORAGE, table_key=t.key, config=jsn_str)
         if t.save is False:
             raise AttributeError("filereader should set table.save = True to avoid repeated imports")
         return t
@@ -771,8 +774,8 @@ class Table(object):
         for step in range(0, len(self), max_task_size):
             config = {
                 'table_key': self.key,
-                'true_key': mem.new_id('/table'),
-                'false_key': mem.new_id('/table'),
+                'true_key': mem.new_id(self.path, '/table'),
+                'false_key': mem.new_id(self.path, '/table'),
                 'shm_name': shm.name, 'shm_shape': arr.shape,
                 'slice_': slice(step, min(step+max_task_size,len(self)),1),
                 'filter_type': filter_type
@@ -793,7 +796,7 @@ class Table(object):
 
         table_true, table_false = None, None
         for task in merge_tasks:
-            tmp_true = Table.load(mem.path, key=task.kwargs['true_key'])
+            tmp_true = Table.load(self.path, key=task.kwargs['true_key'])
             if table_true is None:
                 table_true = tmp_true
             elif len(tmp_true):
@@ -801,7 +804,7 @@ class Table(object):
             else:
                 pass
                 
-            tmp_false = Table.load(mem.path, key=task.kwargs['false_key'])
+            tmp_false = Table.load(self.path, key=task.kwargs['false_key'])
             if table_false is None:
                 table_false = tmp_false
             elif len(tmp_false):
@@ -876,7 +879,7 @@ class Table(object):
             columns_refs = {}
             for name in self.columns:
                 col = self[name]
-                columns_refs[name] = d_key = mem.new_id('/column')
+                columns_refs[name] = d_key = mem.new_id(self.path, '/column')
                 tasks.append(Task(indexing_task, source_key=col.key, destination_key=d_key, shm_name_for_sort_index=shm.name, shape=arr.shape))
 
             with TaskManager(cpu_count=min(psutil.cpu_count(), len(tasks))) as tm:
@@ -885,12 +888,12 @@ class Table(object):
                     msg = '\n'.join(errs)
                     raise Exception(f"multiprocessing error:{msg}")
 
-            table_key = mem.new_id('/table')
-            mem.create_table(key=table_key, columns=columns_refs)
+            table_key = mem.new_id(self.path, '/table')
+            mem.create_table(self.path, key=table_key, columns=columns_refs)
             
             shm.close()
             shm.unlink()
-            t = Table.load(path=mem.path, key=table_key)
+            t = Table.load(path=self.path, key=table_key)
             return t            
 
     def is_sorted(self, **kwargs):  
@@ -920,7 +923,7 @@ class Table(object):
         columns_refs = {}
         for name in self.columns:
             col = self[name]
-            d_key = mem.new_id('/column')
+            d_key = mem.new_id(self.path, '/column')
             columns_refs[name] = d_key
             t = Task(compress_task, source_key=col.key, destination_key=d_key, shm_index_name=shm.name, shape=arr.shape)
             tasks.append(t)
@@ -932,15 +935,15 @@ class Table(object):
                     print(r)
                 raise Exception("!")
         
-        with h5py.File(mem.path, 'r+') as h5:
-            table_key = mem.new_id('/table')
+        with h5py.File(self.path, 'r+') as h5:
+            table_key = mem.new_id(self.path, '/table')
             dset = h5.create_dataset(name=f"/table/{table_key}", dtype=h5py.Empty('f'))
             dset.attrs['columns'] = json.dumps(columns_refs)  
             dset.attrs['saved'] = False
         
         shm.close()
         shm.unlink()
-        t = Table.load(path=mem.path, key=table_key)
+        t = Table.load(path=self.path, key=table_key)
         return t
 
     def all(self, **kwargs):  
@@ -1277,12 +1280,12 @@ class Table(object):
         columns_refs = {}
         for name in left_columns:
             col = self[name]
-            columns_refs[name] = d_key = mem.new_id('/column')
+            columns_refs[name] = d_key = mem.new_id(self.path, '/column')
             tasks.append(Task(indexing_task, source_key=col.key, destination_key=d_key, shm_name_for_sort_index=left_shm.name, shape=left_arr.shape))
 
         for name in right_columns:
             col = other[name]
-            columns_refs[name] = d_key = mem.new_id('/column')
+            columns_refs[name] = d_key = mem.new_id(self.path, '/column')
             tasks.append(Task(indexing_task, source_key=col.key, destination_key=d_key, shm_name_for_sort_index=right_shm.name, shape=right_arr.shape))
 
         with TaskManager(cpu_count=min(psutil.cpu_count(), len(tasks))) as tm:
@@ -1294,8 +1297,8 @@ class Table(object):
                         print(err)
                 raise Exception("multiprocessing error.")
             
-        with h5py.File(mem.path, 'r+') as h5:
-            table_key = mem.new_id('/table')
+        with h5py.File(self.path, 'r+') as h5:
+            table_key = mem.new_id(self.path, '/table')
             dset = h5.create_dataset(name=f"/table/{table_key}", dtype=h5py.Empty('f'))
             dset.attrs['columns'] = json.dumps(columns_refs)  
             dset.attrs['saved'] = False
@@ -1305,8 +1308,8 @@ class Table(object):
         right_shm.close()
         right_shm.unlink()
 
-        t = Table.load(path=mem.path, key=table_key)
-        return t            
+        t = Table.load(path=self.path, key=table_key)
+        return t
 
     def left_join(self, other, left_keys, right_keys, left_columns=None, right_columns=None):  # TODO: This is slow single core code.
         """
@@ -1531,7 +1534,7 @@ class Table(object):
 
             for name in other.columns:
                 col = other[name]
-                columns_refs[name] = d_key = mem.new_id('/column')
+                columns_refs[name] = d_key = mem.new_id(self.path, '/column')
                 tasks.append(Task(indexing_task, source_key=col.key, destination_key=d_key, shm_name_for_sort_index=right_shm.name, shape=right_arr.shape))
 
             # 3. let task manager handle the tasks
@@ -1545,7 +1548,7 @@ class Table(object):
             right_shm.unlink()
 
             # 5. update the result table.
-            with h5py.File(mem.path, 'r+') as h5:
+            with h5py.File(self.path, 'r+') as h5:
                 dset = h5[f"/table/{result.key}"]
                 columns = dset.attrs['columns']
                 columns.update(columns_refs)
@@ -1553,24 +1556,25 @@ class Table(object):
                 dset.attrs['saved'] = False
             
             # 6. reload the result table
-            t = Table.load(path=mem.path, key=result.key)
+            t = Table.load(path=self.path, key=result.key)
             return t
 
 
 class Column(object):
-    def __init__(self, data=None, key=None) -> None:
+    def __init__(self, data=None, key=None, path=H5_STORAGE) -> None:
+        self.path = mem.check_path(path)
 
         if key is None:
-            self.key = mem.new_id('/column')
+            self.key = mem.new_id(self.path, '/column')
         else:
             self.key = key            
-        self.group = f"/column/{self.key}"
+        # self.group = f"/column/{self.key}"
         if key is None:
             self._len = 0
             if data is not None:
                 self.extend(data)
         else:
-            length, pages = mem.load_column_attrs(self.group)
+            length, pages = mem.load_column_attrs(self.path, self.key)
             self._len = length
     
     def __str__(self) -> str:
@@ -1583,7 +1587,7 @@ class Column(object):
         """
         returns dict with datatype: frequency of occurrence
         """
-        return mem.get_pages(self.group).get_types()
+        return mem.get_pages(self.path, self.key).get_types()
 
     @classmethod
     def load(cls, key):
@@ -1602,7 +1606,7 @@ class Column(object):
         if not isinstance(slc, slice):
             raise TypeError(f"expected slice or int, got {type(item)}")
         
-        result = mem.get_data(self.group, slc)
+        result = mem.get_data(self.path, self.key, slc)
 
         if isinstance(item, int) and len(result)==1:
             return result[0]
@@ -1610,14 +1614,14 @@ class Column(object):
             return result
 
     def clear(self):
-        old_pages = mem.get_pages(self.group)
-        self._len = mem.create_virtual_dataset(self.group, pages_before=old_pages, pages_after=[])
+        old_pages = mem.get_pages(self.path, self.key)
+        self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=old_pages, pages_after=[])
 
     def append(self, value):
         self.__setitem__(key=slice(self._len,None,None), value=[value])
         
     def insert(self, index, value):        
-        old_pages = mem.get_pages(self.group)
+        old_pages = mem.get_pages(self.path, self.key)
         new_pages = old_pages[:]
 
         ix, start, _, page = old_pages.get_page_by_index(index)
@@ -1631,18 +1635,18 @@ class Column(object):
             new_page = Page(data)  # copy the existing page so insert can be done below
 
         new_pages[ix] = new_page  # insert the changed page.
-        self._len = mem.create_virtual_dataset(self.group, pages_before=old_pages, pages_after=new_pages)
+        self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=old_pages, pages_after=new_pages)
     
     def extend(self, values):
         self.__setitem__(slice(self._len,None,None), values)  #  self._extend_from_column(values)
         
     def remove(self, value):
         """ see also remove_all """
-        pages = mem.get_pages(self.group)
+        pages = mem.get_pages(self.path, self.key)
         for ix, page in enumerate(pages):
             if value not in page[:]:
                 continue
-            if mem.get_ref_count(page) == 1:
+            if mem.get_ref_count(self.path, page) == 1:
                 page.remove(value)
                 new_pages = pages[:]
             else:
@@ -1652,13 +1656,13 @@ class Column(object):
                 new_page = page(data)  # create new page from copy
                 new_pages = pages[:] 
                 new_pages[ix] = new_page  # register the newly copied page.
-            self._len = mem.create_virtual_dataset(self.group, pages_before=pages, pages_after=new_pages)
+            self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=pages, pages_after=new_pages)
             return
         raise ValueError(f"value not found: {value}")
 
     def remove_all(self, value):
         """ see also remove """
-        pages = mem.get_pages(self.group)
+        pages = mem.get_pages(self.path, self.key)
         new_pages = pages[:]
         for ix, page in enumerate(pages):
             if value not in page[:]:
@@ -1666,16 +1670,16 @@ class Column(object):
             new_data = [v for v in page[:] if v != value]
             new_page = Page(new_data)
             new_pages[ix] = new_page
-        self._len = mem.create_virtual_dataset(self.group, pages_before=pages, pages_after=new_pages)
+        self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=pages, pages_after=new_pages)
         
     def pop(self, index):
         index = self._len + index if index < 0 else index
         if index > self._len:
             raise IndexError(f"can't reach index {index} when length is {self._len}")
 
-        pages = mem.get_pages(self.group)
+        pages = mem.get_pages(self.path, self.key)
         ix,start,_, page = pages.get_page_by_index(index)
-        if mem.get_ref_count(page) == 1:
+        if mem.get_ref_count(self.path, page) == 1:
             value = page.pop(index-start)
         else:
             data = page[:]
@@ -1683,7 +1687,7 @@ class Column(object):
             new_page = Page(data)
             new_pages = pages[:]
             new_pages[ix] = new_page
-        shape = mem.create_virtual_dataset(self.group, pages_before=pages, pages_after=new_pages)
+        shape = mem.create_virtual_dataset(self.path, self.key, pages_before=pages, pages_after=new_pages)
         self._len = shape
         return value
 
@@ -1696,7 +1700,7 @@ class Column(object):
                 raise TypeError(f"your key is an integer, but your value is a {type(value)}. Did you mean to insert? F.x. [{key}:{key+1}] = {value} ?")
             if -self._len-1 < key < self._len:
                 key = self._len + key if key < 0 else key
-                pages = mem.get_pages(self.group)
+                pages = mem.get_pages(self.path, self.key)
                 ix,start,_,page = pages.get_page_by_index(key)
                 if mem.get_ref_count(page) == 1:
                     page[key-start] = value
@@ -1706,7 +1710,7 @@ class Column(object):
                     new_page = Page(data)
                     new_pages = pages[:]
                     new_pages[ix] = new_page
-                    self._len = mem.create_virtual_dataset(self.group, pages_before=pages, pages_after=new_pages)
+                    self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=pages, pages_after=new_pages)
             else:
                 raise IndexError("list assignment index out of range")
 
@@ -1715,30 +1719,30 @@ class Column(object):
             if key.start == key.stop == None and key.step in (None,1): 
                 # documentation: new = list(value)
                 # example: L[:] = [1,2,3]
-                before = mem.get_pages(self.group)
+                before = mem.get_pages(self.path, self.key)
                 if isinstance(value, Column):
-                    after = mem.get_pages(value.group)
+                    after = mem.get_pages(self.path, value.key)
                 elif isinstance(value, (list,tuple,np.ndarray)):
                     new_page = Page(value)
                     after = Pages([new_page])
                 else:
                     raise TypeError
-                self._len = mem.create_virtual_dataset(self.group, pages_before=before, pages_after=after)
+                self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=before, pages_after=after)
 
             elif key.start != None and key.stop == key.step == None:   
                 # documentation: new = old[:key.start] + list(value)
                 # example: L[0:] = [1,2,3]
-                before = mem.get_pages(self.group) 
+                before = mem.get_pages(self.path, self.key)
                 before_slice = before.getslice(0,start)
 
                 if isinstance(value, Column):
-                    after = before_slice + mem.get_pages(value.group)
+                    after = before_slice + mem.get_pages(value.path, value.key)
                 elif isinstance(value, (list, tuple, np.ndarray)):
                     if not before_slice:
                         after = Pages((Page(value),))
                     else:
                         last_page = before_slice[-1] 
-                        if mem.get_ref_count(last_page) == 1:
+                        if mem.get_ref_count(self.path, last_page) == 1:
                             last_page.extend(value)
                             after = before_slice
                         else:  # ref count > 1
@@ -1746,31 +1750,31 @@ class Column(object):
                             after = before_slice + Pages([new_page])
                 else:
                     raise TypeError
-                self._len = mem.create_virtual_dataset(self.group, pages_before=before, pages_after=after)
+                self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=before, pages_after=after)
 
             elif key.stop != None and key.start == key.step == None:  
                 # documentation: new = list(value) + old[key.stop:] 
                 # example: L[:3] = [1,2,3]
-                before = mem.get_pages(self.group)
+                before = mem.get_pages(self.path, self.key)
                 before_slice = before.getslice(stop, self._len)
                 if isinstance(value, Column):
-                    after = mem.get_pages(value.group) + before_slice
+                    after = mem.get_pages(value.path, value.group) + before_slice
                 elif isinstance(value, (list,tuple, np.ndarray)):
                     new_page = Page(value)
                     after = Pages([new_page]) + before_slice
                 else:
                     raise TypeError
-                self._len = mem.create_virtual_dataset(self.group, pages_before=before, pages_after=after)
+                self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=before, pages_after=after)
                 
             elif key.step == None and key.start != None and key.stop != None:  # L[3:5] = [1,2,3]
                 # documentation: new = old[:start] + list(values) + old[stop:] 
                 
                 stop = max(start,stop)  #  one of python's archaic rules.
 
-                before = mem.get_pages(self.group)
+                before = mem.get_pages(self.path, self.key)
                 A, B = before.getslice(0,start), before.getslice(stop, self._len)
                 if isinstance(value, Column):
-                    after = A + mem.get_pages(value.group) + B
+                    after = A + mem.get_pages(value.path, value.key) + B
                 elif isinstance(value, (list, tuple, np.ndarray)):
                     if value:
                         new_page = Page(value)
@@ -1779,7 +1783,7 @@ class Column(object):
                         after = A + B
                 else:
                     raise TypeError
-                self._len = mem.create_virtual_dataset(self.group, pages_before=before, pages_after=after)
+                self._len = mem.create_virtual_dataset(self.path,self.key, pages_before=before, pages_after=after)
 
             elif key.step != None:
                 seq = range(start,stop,step)
@@ -1788,14 +1792,14 @@ class Column(object):
                     raise ValueError(f"attempt to assign sequence of size {len(value)} to extended slice of size {seq_size}")
                 
                 # documentation: See also test_slice_rules.py/MyList for details
-                before = mem.get_pages(self.group)
-                new = mem.get_data(self.group, slice(None)).tolist()  # new = old[:]  # cheap shallow pointer copy in case anything goes wrong.
+                before = mem.get_pages(self.path, self.key)
+                new = mem.get_data(self.path, self.key, slice(None)).tolist()  # new = old[:]  # cheap shallow pointer copy in case anything goes wrong.
                 for new_index, position in zip(range(len(value)), seq):
                     new[position] = value[new_index]
                 # all went well. No exceptions. Now update self.
                 after = Pages([Page(new)])  # This may seem redundant, but is in fact is good as the user may 
                 # be cleaning up the dataset, so that we end up with a simple datatype instead of mixed.
-                self._len = mem.create_virtual_dataset(self.group, pages_before=before, pages_after=after)
+                self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=before, pages_after=after)
             else:
                 raise KeyError(f"bad key: {key}")
         else:
@@ -1804,38 +1808,38 @@ class Column(object):
     def __delitem__(self, key):
         if isinstance(key, int):
             if -self._len-1 < key < self._len:
-                before = mem.get_pages(self.group)
+                before = mem.get_pages(self.path, self.key)
                 after = before[:]
                 ix,start,_,page = before.get_page_by_index(key)
-                if mem.get_ref_count(page) == 1:
+                if mem.get_ref_count(self.path, page) == 1:
                     del page[key-start]
                 else:
-                    data = mem.get_data(page.group)
+                    data = mem.get_data(self.path, page.group) # FIXME
                     mask = np.ones(shape=data.shape)
                     new_data = np.compress(mask, data,axis=0)
                     after[ix] = Page(new_data)
             else:
                 raise IndexError("list assignment index out of range")
 
-            self._len = mem.create_virtual_dataset(self.group, pages_before=before, pages_after=after)
+            self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=before, pages_after=after)
 
         elif isinstance(key, slice):
             start,stop,step = key.indices(self._len)
-            before = mem.get_pages(self.group)
+            before = mem.get_pages(self.path, self.key)
             if key.start == key.stop == None and key.step in (None,1):   # del L[:] == L.clear()
-                self._len = mem.create_virtual_dataset(self.group, pages_before=before, pages_after=[])
+                self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=before, pages_after=[])
             elif key.start != None and key.stop == key.step == None:   # del L[0:] 
                 after = before.getslice(0, start)
-                self._len = mem.create_virtual_dataset(self.group, pages_before=before, pages_after=after)
+                self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=before, pages_after=after)
             elif key.stop != None and key.start == key.step == None:  # del L[:3] 
                 after = before.getslice(stop, self._len)
-                self._len = mem.create_virtual_dataset(self.group, pages_before=before, pages_after=after)
+                self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=before, pages_after=after)
             elif key.step == None and key.start != None and key.stop != None:  # del L[3:5]
                 after = before.getslice(0, start) + before.getslice(stop, self._len)
-                self._len = mem.create_virtual_dataset(self.group, pages_before=before, pages_after=after)
+                self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=before, pages_after=after)
             elif key.step != None:
-                before = mem.get_pages(self.group)
-                data = mem.get_data(self.group, slice(None))
+                before = mem.get_pages(self.path, self.key)
+                data = mem.get_data(self.path, self.group, slice(None))
                 mask = np.ones(shape=data.shape)
                 for i in range(start,stop,step):
                     mask[i] = 0
@@ -1843,7 +1847,7 @@ class Column(object):
                 # all went well. No exceptions.
                 after = Pages([Page(new)])  # This may seem redundant, but is in fact is good as the user may 
                 # be cleaning up the dataset, so that we end up with a simple datatype instead of mixed.
-                self._len = mem.create_virtual_dataset(self.group, pages_before=before, pages_after=after)
+                self._len = mem.create_virtual_dataset(self.path, self.key, pages_before=before, pages_after=after)
             else:
                 raise TypeError(f"bad key: {key}")
         else:
@@ -1857,7 +1861,7 @@ class Column(object):
             return all(a==b for a,b in zip(self[:],other))
         
         elif isinstance(other, Column):  
-            if mem.get_pages(self.group) == mem.get_pages(other.group):  # special case.
+            if mem.get_pages(self.path, self.key)== mem.get_pages(other.path, other.group):  # special case.
                 return True  
             else:
                 return (self[:] == other[:]).all()
@@ -1935,18 +1939,18 @@ class Column(object):
     def __imul__(self, other):
         if not isinstance(other, int):
             raise TypeError(f"a column can be repeated an integer number of times, not {type(other)} number of times")
-        old_pages = mem.get_pages(self.group)
+        old_pages = mem.get_pages(self.path, self.key)
         new_pages = old_pages * other
-        self._len = mem.create_virtual_dataset(self.group, old_pages, new_pages)
+        self._len = mem.create_virtual_dataset(self.path, self.key, old_pages, new_pages)
         return self
     
     def __mul__(self, other):
         if not isinstance(other, int):
             raise TypeError(f"a column can be repeated an integer number of times, not {type(other)} number of times")
         new = Column()
-        old_pages = mem.get_pages(self.group)
+        old_pages = mem.get_pages(self.path, self.key)
         new_pages = old_pages * other
-        new._len = mem.create_virtual_dataset(new.group, old_pages, new_pages)
+        new._len = mem.create_virtual_dataset(new.path, new.key, old_pages, new_pages)
         return new
     
     def __ne__(self, other):
@@ -2016,16 +2020,16 @@ def filter_evaluation_task(table_key, expression, shm_name, shm_index, shm_shape
     v1 = expression.get('value1',None)
     v2 = expression.get('value2',None)
 
-    columns = mem.mp_get_columns(table_key)
+    columns = mem.mp_get_columns(H5_STORAGE,  table_key)
     if c1 is not None:
         column_key = columns[c1]
-        dset_A = mem.get_data(f'/column/{column_key}', slice_)
+        dset_A = mem.get_data(path=H5_STORAGE,  column_key=column_key, item=slice_)
     else:  # v1 is active:
         dset_A = np.array([v1] * (slice_.stop-slice_.start))
     
     if c2 is not None:
         column_key = columns[c2]
-        dset_B = mem.get_data(f'/column/{column_key}', slice_)
+        dset_B = mem.get_data(H5_STORAGE, column_key, slice_)
     else:  # v2 is active:
         dset_B = np.array([v2] * (slice_.stop-slice_.start))
 
@@ -2051,7 +2055,7 @@ def filter_merge_task(table_key, true_key, false_key, shm_name, shm_shape, slice
     false_mask = np.invert(true_mask)    
     
     # 2. load source
-    columns = mem.mp_get_columns(table_key)
+    columns = mem.mp_get_columns(H5_STORAGE, table_key)
 
     true_columns, false_columns = {}, {}
     for col_name, column_key in columns.items():
@@ -2059,13 +2063,13 @@ def filter_merge_task(table_key, true_key, false_key, shm_name, shm_shape, slice
         slize = col[slice_]  # maybe use .tolist() ?
         true_values = slize[true_mask]
         if np.any(true_mask):
-            true_columns[col_name] = mem.mp_write_column(true_values)
+            true_columns[col_name] = mem.mp_write_column(H5_STORAGE, true_values)
         false_values = slize[false_mask]
         if np.any(false_mask):
-            false_columns[col_name] = mem.mp_write_column(false_values) 
+            false_columns[col_name] = mem.mp_write_column(H5_STORAGE,  false_values) 
         
-    mem.mp_write_table(true_key, true_columns)
-    mem.mp_write_table(false_key, false_columns)
+    mem.mp_write_table(H5_STORAGE, true_key, true_columns)
+    mem.mp_write_table(H5_STORAGE, false_key, false_columns)
     
     existing_shm.close()  # disconnect
 
@@ -2289,7 +2293,7 @@ def text_reader(path, newline='\n', text_qualifier=None, delimiter=',', first_ro
                         fo.write("".join(parts))
                     pbar.update(len(parts))
                     parts.clear()
-                    tasks.append( Task( text_reader_task, **{**config, **{"source":str(p), "table_key":mem.new_id('/table'), 'encoding':'utf-8'}} ) )
+                    tasks.append( Task( text_reader_task, **{**config, **{"source":str(p), "table_key":mem.new_id(H5_STORAGE, '/table'), 'encoding':'utf-8'}} ) )
                     
             if parts:  # any remaining parts at the end of the loop.
                 p = TEMPDIR / (path.stem + f'{ix}' + path.suffix)
@@ -2298,8 +2302,8 @@ def text_reader(path, newline='\n', text_qualifier=None, delimiter=',', first_ro
                     fo.write("".join(parts))
                 pbar.update(len(parts))
                 parts.clear()
-                config.update({"source":str(p), "table_key":mem.new_id('/table')})
-                tasks.append( Task( text_reader_task, **{**config, **{"source":str(p), "table_key":mem.new_id('/table'), 'encoding':'utf-8'}} ) )
+                config.update({"source":str(p), "table_key":mem.new_id(H5_STORAGE, '/table')})  ###? FIXME?
+                tasks.append( Task( text_reader_task, **{**config, **{"source":str(p), "table_key":mem.new_id(H5_STORAGE, '/table'), 'encoding':'utf-8'}} ) )
         
         # execute the tasks
     # with TaskManager(cpu_count=min(cpu_count, len(tasks))) as tm:
@@ -2317,7 +2321,7 @@ def text_reader(path, newline='\n', text_qualifier=None, delimiter=',', first_ro
     # consolidate the task results
     t = None
     for task in tasks:
-        tmp = Table.load(path=mem.path, key=task.kwargs["table_key"])
+        tmp = Table.load(path=H5_STORAGE, key=task.kwargs["table_key"])
         if t is None:
             t = tmp.copy()
         else:
@@ -2383,8 +2387,8 @@ def text_reader_task(source, table_key, columns,
     columns_refs = {}
     for col_name, values in data.items():
         values = DataTypes.guess(values)
-        columns_refs[col_name] = mem.mp_write_column(values)
-    mem.mp_write_table(table_key, columns=columns_refs)
+        columns_refs[col_name] = mem.mp_write_column(H5_STORAGE, values)
+    mem.mp_write_table(H5_STORAGE, table_key, columns=columns_refs)
 
 
 file_readers = {
@@ -2417,11 +2421,11 @@ def indexing_task(source_key, destination_key, shm_name_for_sort_index, shape):
     existing_shm = shared_memory.SharedMemory(name=shm_name_for_sort_index)  # connect
     sort_index = np.ndarray(shape, dtype=np.int64, buffer=existing_shm.buf)
 
-    data = mem.get_data(f'/column/{source_key}', slice(None)) # --- READ!
+    data = mem.get_data(H5_STORAGE, f'/column/{source_key}', slice(None)) # --- READ!
     values = [data[ix] for ix in sort_index]
     
     existing_shm.close()  # disconnect
-    mem.mp_write_column(values, column_key=destination_key)  # --- WRITE!
+    mem.mp_write_column(H5_STORAGE, values, column_key=destination_key)  # --- WRITE!
 
 
 def compress_task(source_key, destination_key, shm_index_name, shape):
@@ -2436,10 +2440,10 @@ def compress_task(source_key, destination_key, shm_index_name, shape):
     existing_shm = shared_memory.SharedMemory(name=shm_index_name)  # connect
     mask = np.ndarray(shape, dtype=np.int64, buffer=existing_shm.buf)
     
-    data = mem.get_data(f'/column/{source_key}', slice(None))  # --- READ!
+    data = mem.get_data(H5_STORAGE, f'/column/{source_key}', slice(None))  # --- READ!
     values = np.compress(mask, data)
     
     existing_shm.close()  # disconnect
-    mem.mp_write_column(values, column_key=destination_key)  # --- WRITE!
+    mem.mp_write_column(H5_STORAGE, values, column_key=destination_key)  # --- WRITE!
 
 

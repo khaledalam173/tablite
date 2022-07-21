@@ -3,6 +3,8 @@ import random
 import json
 import functools
 import logging
+import pathlib
+from functools import lru_cache
 
 log = logging.getLogger(__name__)
 
@@ -14,7 +16,7 @@ DIGITS = set(digits)
 import h5py  #https://stackoverflow.com/questions/27710245/is-there-an-analysis-speed-or-memory-usage-advantage-to-using-hdf5-for-large-arr?rq=1  
 import numpy as np
 
-from tablite.config import H5_STORAGE, H5_PAGE_SIZE, H5_ENCODING
+from tablite.config import H5_STORAGE, H5_PAGE_SIZE, H5_ENCODING, H5_FILENAME, H5_PAGES_NAME
 from tablite.utils import intercept
 from tablite.datatypes import DataTypes,numpy_types
 
@@ -25,6 +27,7 @@ TRUNCATE = 'w'   # w  Create file, truncate if exists
 #                a    Read/write if exists, create otherwise
 TIMEOUT = 10*60 * 1000  # maximum msec tolerance waiting for OS to release hdf5 write lock
 
+REF_COUNTS = defaultdict(int)
 
 def timeout(func):
     @functools.wraps(func)
@@ -52,251 +55,285 @@ def timeout(func):
     return wrapper
 
 
-class MemoryManager(object):
-    def __init__(self) -> None:
-        self.ref_counts = defaultdict(int)
+def new_id(path, group):
+    if group not in {'/page', '/column', '/table'}:
+        raise ValueError(f"expected group to be /page, /column or /table. Not {group}")
+
+    with h5py.File(path, READWRITE) as h5:
+        if group not in h5.keys():
+            raise TypeError("h5 storage has not been setup correctly.")  
         
-        self.path = H5_STORAGE
-        if not self.path.exists():
-            self.path.touch()  
+        dset = h5[group]
+        dset.attrs['pid'] = pid = dset.attrs.get('pid', 0) + 1
+        return str(pid)
 
-    @timeout
-    def new_id(self, group):
-        if group not in {'/page', '/column', '/table'}:
-            raise ValueError(f"expected group to be /page, /column or /table. Not {group}")
+@lru_cache()
+def check_path(path):
+    if not isinstance(path, pathlib.Path):
+            path = pathlib.Path(path)
+    if not path.is_file():
+        raise TypeError()
+    if not path.name.endswith('.h5'):
+        raise TypeError()
+    
+    if not path.parent.exists():  # create it.
+        log.info(f"creating tablite directory on {path}")
+        path.mkdir()
+    
+    if not (path.parent / H5_PAGES_NAME).exists():
+        (path.parent / H5_PAGES_NAME).mkdir()
 
-        with h5py.File(H5_STORAGE, READWRITE) as h5:
+    with h5py.File(path, READWRITE) as h5:
+        for group in ['/table', '/column', 'page']:
             if group not in h5.keys():
                 h5.create_group(group)
-            dset = h5[group]
-            dset.attrs['pid'] = pid = dset.attrs.get('pid', 0) + 1
-            return str(pid)
-
-    def create_table(self, key=None, save=False, config=None, columns=None):
-        with h5py.File(self.path, READWRITE) as h5:
-            if key is None:
-                key = self.new_id('/table')
-            dset = h5.create_dataset(name=f"/table/{key}", dtype=h5py.Empty('f'))
-            assert isinstance(save, bool)
-            dset.attrs['saved'] = save
-            if config is not None:
-                dset.attrs['config'] = config
-            if columns is None:
-                columns = {}
-            elif not isinstance(columns, dict):
-                raise TypeError()
-            dset.attrs['columns'] = json.dumps(columns)  
-            return key
-
-    def set_config(self, group, config):
-        """ 
-        method used to set config after table creation.
-        """  # used by Table.import_file(...) at the end of the import.
-        if not isinstance(config, str):
-            raise TypeError(f"not a string: {config}")
-        with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[group]
-            dset.attrs['config'] = config
-
-    def set_saved_flag(self, group, value):
-        with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[group]
-            dset.attrs['saved'] = value
-
-    def create_column_reference(self, table_key, column_name, column_key):  # /column/{key}
-        if not isinstance(table_key, str) and set(table_key).issubset(DIGITS):
-            raise ValueError
-        if not isinstance(column_key, str) and set(column_key).issubset(DIGITS):
-            raise ValueError
-        with h5py.File(self.path, READWRITE) as h5:
-            table_group = f"/table/{table_key}"
-            dset = h5[table_group]  
-            columns = json.loads(dset.attrs['columns'])
-            columns[column_name] = column_key
-            dset.attrs['columns'] = json.dumps(columns) 
-            
-    def delete_table(self, table_key):        
-        with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[table_key]
-            saved_flag = dset.attrs['saved']
-            if saved_flag:
-                return
-            del h5[table_key]
-            
-    def delete_column_reference(self, table_key, column_name, column_key):
-        with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[table_key]
-            saved_flag = dset.attrs['saved']
-            if saved_flag:
-                return
-
-            columns = json.loads(dset.attrs['columns'])
-            if column_name in columns:
-                del columns[column_name] 
-            dset.attrs['columns'] = json.dumps(columns)       
-
-            pages = self.get_pages(f"/column/{column_key}")
-            del h5[f"/column/{column_key}"]  # deletes the virtual dataset.
-            
-            for page in pages:
-                self.ref_counts[page.group] -= 1
-
-            self.del_pages_if_required(pages)
-
-    def del_pages_if_required(self, pages):
-        if not pages:
-            return
-        with h5py.File(self.path, READWRITE) as h5:
-            for page in set(pages):
-                if self.ref_counts[page.group]==0:
-                    dset = h5[page.group]
-                    if dset.attrs['datatype'] == 'typearray':
-                        del h5[f"{page.group}_types"]
-                    del h5[page.group]        
-                    del self.ref_counts[page.group]
-
-    def create_virtual_dataset(self, group, pages_before, pages_after):
-        """ The consumer API for Columns to create, update and delete datasets."""
-        if not isinstance(pages_before,Pages):
-            raise TypeError("expected Pages.")
-        if not isinstance(pages_after, Pages):
-            raise TypeError("expected Pages.")
-                
-        with h5py.File(self.path, READWRITE) as h5:
-            # 1. adjust ref count by adding first, then remove, as this prevents ref count < 1.
-            all_pages = pages_before + pages_after
-            assert isinstance(all_pages, Pages)
-
-            for page in pages_after:
-                if len(page)==0:
-                    raise ValueError("page length == 0")
-                self.ref_counts[page.group] += 1
-            for page in pages_before:
-                self.ref_counts[page.group] -= 1
-                
-            self.del_pages_if_required(pages_before)
-           
-            if group in h5:
-                del h5[group]
-
-            dset = h5.create_dataset(name=group, dtype=h5py.Empty('f'))
-            dset.attrs['pages'] = json.dumps([page.group for page in pages_after])
-            dset.attrs['length'] = shape = pages_after.length()
-            return shape
-
-    @timeout
-    def load_column_attrs(self, group):
-        with h5py.File(self.path, READONLY) as h5:
-            dset = h5[group]
-            page_groups = json.loads(dset.attrs['pages'])
-            length = dset.attrs['length']
-            return length, page_groups
-
-    def get_imported_tables(self):
-        """
-        returns dict with table key and json of import config
-        """
-        configs = {}
-        with h5py.File(self.path, READONLY) as h5:
-            if "/table" in h5.keys():
-                for table_key in h5["/table"].keys():
-                    dset = h5[f"/table/{table_key}"]
-                    config = dset.attrs.get('config',None)
-                    if config is not None:
-                        configs[table_key] = dset.attrs['config']
-        return configs
-
-    def get_pages(self, group):
-        if not group.startswith('/column'):
-            raise ValueError
-
-        with h5py.File(self.path, READONLY) as h5:
-            if group not in h5:
-                return Pages()
-            else:
-                dset = h5[group]
-                pages = json.loads(dset.attrs['pages'])
-                unique_pages = {pg_grp:Page.load(pg_grp) for pg_grp in set(pages)}   # loading the page once and then copy the pointer,
-                loaded_pages = Pages([unique_pages[pg_grp] for pg_grp in pages])            # is 10k faster than loading the page 10k times.
-                return loaded_pages
-
-    def get_ref_count(self, page):
-        assert isinstance(page, Page)
-        return self.ref_counts[page.group]
-
-    def reset_storage(self):
-        log.info(f"{getpid()} resetting storage.")
-        with h5py.File(self.path, TRUNCATE) as h5:
-            assert list(h5.keys()) == []
-        time.sleep(1)  # let the OS flush the write outbuffer.
-        
-    @timeout
-    def get_data(self, group, item):
-        if not group.startswith('/column'):
-            raise ValueError("get data should be called by columns only.")
-        if not isinstance(item, (int,slice)):
-            raise TypeError(f'{type(item)} is not slice')
-        
-        with h5py.File(self.path, READONLY) as h5:
-            if group not in h5:
-                return np.array([])
-            dset = h5[group]
-                        
-            # As a Column can have multiple datatypes across the pages, traversal is required.
-            arrays = []
-            assert isinstance(item, slice)
-            item_range = range(*item.indices(dset.attrs['length']))
-            
-            start,end = 0,0
-            pages = self.get_pages(group)
-            for page in pages:  # loaded Pages
-                start = end
-                end += len(page)
-                ro = intercept(range(start,end,1), item_range)  # check if the slice is worth converting.
-                if len(ro)!=0:  # fetch the slice and filter it.
-                    search_slice = slice(ro.start - start, ro.stop - start, ro.step)
-                    match = page[search_slice]  # page.__getitem__ handles type conversion for Mixed and Str types.
-                    arrays.append(match)
-            
-            dtype, _ = Page.layout(pages)
-            return np.concatenate(arrays, dtype=dtype)
     
-    @timeout
-    def mp_write_column(self, values, column_key=None):  # for column
-        """
-        multi processing helper for writing column data.
-        """
-        with h5py.File(self.path, READWRITE) as h5:
-            new_page = Page(values)
-            if not column_key:
-                column_key = self.new_id('/column')
-            dset = h5.create_dataset(name=f'/column/{column_key}', dtype=h5py.Empty('f'))
-            dset.attrs['pages'] = json.dumps([new_page.group])
-            dset.attrs['length'] = len(new_page)
-            return column_key
+    
+    return path
 
-    @timeout
-    def mp_write_table(self, table_key, columns):
-        """
-        multi processing helper for writing table data.
-        """
-        assert isinstance(columns, dict)
-        with h5py.File(self.path, 'r+') as h5:
-            dset = h5.create_dataset(name=f"/table/{table_key}", dtype=h5py.Empty('f'))
-            dset.attrs['columns'] = json.dumps(columns)  
-            dset.attrs['saved'] = True  # delete control resides with __main__
 
-    @timeout
-    def mp_get_columns(self, table_key):
-        """
-        multi processing helper for getting column names and keys from an existing table.
-        """
-        with h5py.File(self.path, READONLY) as h5:
-            group = f"/table/{table_key}"
+def create_table(path, key=None, save=False, config=None, columns=None):
+    with h5py.File(path, READWRITE) as h5:
+        if key is None:
+            key = new_id('/table')
+        dset = h5.create_dataset(name=f"/table/{key}", dtype=h5py.Empty('f'))
+        assert isinstance(save, bool)
+        dset.attrs['saved'] = save
+        if config is not None:
+            dset.attrs['config'] = config
+        if columns is None:
+            columns = {}
+        elif not isinstance(columns, dict):
+            raise TypeError()
+        dset.attrs['columns'] = json.dumps(columns)  
+        return key
+
+def set_saved_flag(path, key, value):
+    with h5py.File(path, READWRITE) as h5:
+        dset = h5[f"/table/{key}"]
+        dset.attrs['saved'] = value
+
+
+def delete_table(path, key):        
+    with h5py.File(path, READWRITE) as h5:
+        group = f"/table/{key}"
+        dset = h5[group]
+        saved_flag = dset.attrs['saved']
+        if saved_flag:
+            return
+        del h5[group]
+
+
+def create_column_reference(path, table_key, column_name, column_key):  # /column/{key}
+    with h5py.File(path, READWRITE) as h5:
+        table_group = f"/table/{table_key}"
+        dset = h5[table_group]  
+        columns = json.loads(dset.attrs['columns'])
+        columns[column_name] = column_key
+        dset.attrs['columns'] = json.dumps(columns) 
+
+
+def get_pages(path, column_key):
+    group = f"/column/{column_key}"
+    with h5py.File(path, READONLY) as h5:
+        if group not in h5:
+            return Pages()
+        else:
             dset = h5[group]
-            columns = json.loads(dset.attrs['columns'])
-            assert isinstance(columns, dict)
-            return columns
+            pages = json.loads(dset.attrs['pages'])
+            unique_pages = {pg_grp:Page.load(pg_grp) for pg_grp in set(pages)}   # loading the page once and then copy the pointer,
+            loaded_pages = Pages([unique_pages[pg_grp] for pg_grp in pages])            # is 10k faster than loading the page 10k times.
+            return loaded_pages
+
+
+def del_page(path, page):
+    global REF_COUNTS
+    with h5py.File(path, READWRITE) as h5:
+        if REF_COUNTS[page.group]==0:
+            dset = h5[page.group]
+            if dset.attrs['datatype'] == 'typearray':
+                del h5[f"{page.group}_types"]
+            del h5[page.group]        
+            del REF_COUNTS[page.group]
+
+
+def delete_column_reference(path, table_key, column_name, column_key):
+    global REF_COUNTS
+    with h5py.File(path, READWRITE) as h5:
+        dset = h5[f"/table/{table_key}"]
+        saved_flag = dset.attrs['saved']
+        if saved_flag:
+            return
+
+        columns = json.loads(dset.attrs['columns'])
+        if column_name in columns:
+            del columns[column_name] 
+        dset.attrs['columns'] = json.dumps(columns)       
+
+        pages = get_pages(path, column_key)
+        del h5[f"/column/{column_key}"]  # deletes the virtual dataset.
+        
+        for page in pages:
+            REF_COUNTS[page.group] -= 1
+            if REF_COUNTS[page.group] == 0:
+                del_page(path, page)
+
+
+def reset_storage(path=None):
+    if path is None:
+        path = H5_STORAGE 
+    log.info(f"{getpid()} resetting storage.")
+    with h5py.File(path, TRUNCATE) as h5:
+        assert list(h5.keys()) == []
+    time.sleep(1)  # let the OS flush the write outbuffer.
+
+
+def get_imported_tables(path):
+    """
+    returns dict with table key and json of import config
+    """
+    if not isinstance(path, pathlib.Path): 
+        raise NotADirectoryError()
+    if not (path / H5_FILENAME).exits():
+        raise FileNotFoundError(f"{H5_FILENAME} not found in {path}")
+    configs = {}
+    with h5py.File(path, READONLY) as h5:
+        if "/table" not in h5.keys():
+            raise ValueError("/table has not been initiated.")
+        for table_key in h5["/table"].keys():
+            dset = h5[f"/table/{table_key}"]
+            config = dset.attrs.get('config',None)
+            if config is not None:
+                configs[table_key] = dset.attrs['config']
+    return configs
+
+
+def set_config(path, table_key, config):
+    """ 
+    method used to set config after table creation.
+    """  # used by Table.import_file(...) at the end of the import.
+    if not isinstance(config, str):
+        raise TypeError(f"not a string: {config}")
+    group = f"/table/{table_key}"
+    with h5py.File(path, READWRITE) as h5:
+        dset = h5[group]
+        dset.attrs['config'] = config
+
+
+def load_column_attrs(path, column_key):
+    group = f"/column/{column_key}"
+    with h5py.File(path, READONLY) as h5:
+        dset = h5[group]
+        page_groups = json.loads(dset.attrs['pages'])
+        length = dset.attrs['length']
+        return length, page_groups
+
+
+def get_data(path, column_key, item):
+    group = f"/column/{column_key}"
+
+    if not isinstance(item, (int,slice)):
+        raise TypeError(f'{type(item)} is not slice')
+    
+    with h5py.File(path, READONLY) as h5:
+        if group not in h5:
+            return np.array([])
+        dset = h5[group]
+                    
+        # As a Column can have multiple datatypes across the pages, traversal is required.
+        arrays = []
+        assert isinstance(item, slice)
+        item_range = range(*item.indices(dset.attrs['length']))
+        
+        start,end = 0,0
+        pages = get_pages(path, column_key)
+        for page in pages:  # loaded Pages
+            start = end
+            end += len(page)
+            ro = intercept(range(start,end,1), item_range)  # check if the slice is worth converting.
+            if len(ro)!=0:  # fetch the slice and filter it.
+                search_slice = slice(ro.start - start, ro.stop - start, ro.step)
+                match = page[search_slice]  # page.__getitem__ handles type conversion for Mixed and Str types.
+                arrays.append(match)
+        
+        dtype, _ = Page.layout(pages)
+        return np.concatenate(arrays, dtype=dtype)
+
+
+def create_virtual_dataset(path, column_key, pages_before, pages_after):
+    """ The consumer API for Columns to create, update and delete datasets."""
+    global REF_COUNTS
+    if not isinstance(pages_before,Pages):
+        raise TypeError("expected Pages.")
+    if not isinstance(pages_after, Pages):
+        raise TypeError("expected Pages.")
+            
+    with h5py.File(path, READWRITE) as h5:
+        # 1. adjust ref count by adding first, then remove, as this prevents ref count < 1.
+        all_pages = pages_before + pages_after
+        assert isinstance(all_pages, Pages)
+
+        for page in pages_after:
+            if len(page)==0:
+                raise ValueError("page length == 0")
+            REF_COUNTS[page.group] += 1
+        for page in pages_before:
+            REF_COUNTS[page.group] -= 1
+            if REF_COUNTS[page.group] == 0:
+                del_page(path, page)
+
+        group = f"/column/{column_key}"
+        if group in h5:
+            del h5[group]
+
+        dset = h5.create_dataset(name=group, dtype=h5py.Empty('f'))
+        dset.attrs['pages'] = json.dumps([page.group for page in pages_after])
+        dset.attrs['length'] = shape = pages_after.length()
+        return shape
+
+
+def get_ref_count(page):
+    global REF_COUNTS
+    assert isinstance(page, Page)
+    return REF_COUNTS[page.group]
+
+
+@timeout
+def mp_get_columns(table_path, table_key):
+    """
+    multi processing helper for getting column names and keys from an existing table.
+    """
+    with h5py.File(table_path, READONLY) as h5:
+        group = f"/table/{table_key}"
+        dset = h5[group]
+        columns = json.loads(dset.attrs['columns'])
+        assert isinstance(columns, dict)
+        return columns
+
+@timeout
+def mp_write_column(path, values, column_key=None):  # for column
+    """
+    multi processing helper for writing column data.
+    """
+    with h5py.File(path, READWRITE) as h5:
+        new_page = Page(values)
+        if not column_key:
+            column_key = new_id(path, '/column')
+        dset = h5.create_dataset(name=f'/column/{column_key}', dtype=h5py.Empty('f'))
+        dset.attrs['pages'] = json.dumps([new_page.group])
+        dset.attrs['length'] = len(new_page)
+        return column_key
+
+@timeout
+def mp_write_table(path, table_key, columns):
+    """
+    multi processing helper for writing table data.
+    """
+    assert isinstance(columns, dict)
+    with h5py.File(path, 'r+') as h5:
+        dset = h5.create_dataset(name=f"/table/{table_key}", dtype=h5py.Empty('f'))
+        dset.attrs['columns'] = json.dumps(columns)  
+        dset.attrs['saved'] = True  # delete control resides with __main__
 
 
 class Pages(list):
@@ -1343,7 +1380,6 @@ class Page(object):
 
     def datatypes(self):
         return self._page.datatypes()
-
 
 
 page_types = {clss.__name__: clss for clss in [MixedType, StringType, SparseType, SimpleType]}
