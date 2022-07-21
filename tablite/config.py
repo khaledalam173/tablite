@@ -1,7 +1,49 @@
-import pathlib, os, tempfile
+import pathlib, tempfile
+import h5py
 
-# The data is from hereon stored as:
+def set_working_dir(path):
+    """ 
+    Helper for changing the working directory.
+    The working directory expects:
 
+    - ./tablite.h5  the index file for tables, columns and pointers to pages
+    - ./tablite/    the folder for individual hdf5 pages. The pages are numerated 1.h5, 2.h5, 3.h5, ..., etc
+    """
+    if isinstance(path,str):
+        path = pathlib.Path(path)
+    if not isinstance(path, pathlib.Path):
+        raise TypeError
+    if not path.is_dir():
+        raise NotADirectoryError()
+    
+    global _H5_FILENAME
+    global H5_INDEX_FILE
+    global H5_DATA_DIR
+    global H5_WORKING_DIR
+    H5_INDEX_FILE = path / _H5_FILENAME     # E.g. tempdir/tablite.h5
+    H5_DATA_DIR = path / _H5_DATA_DIR_NAME  # E.g. tempdir/tablite
+
+    if not H5_DATA_DIR.exists():
+        H5_DATA_DIR.mkdir()
+    
+    # linux requires that files have headers, so this will guarantee it:
+    if not H5_INDEX_FILE.exists():
+        with h5py.File(H5_INDEX_FILE, 'w') as h5:
+            h5.create_group('/table')
+            h5.create_group('/column')
+            h5.create_group('/page')
+    
+
+H5_DATA_DIR = ""
+H5_INDEX_FILE = ""
+
+_H5_FILENAME = 'tablite.h5'
+_H5_DATA_DIR_NAME = 'tablite'
+
+set_working_dir(path=pathlib.Path(tempfile.gettempdir()))
+
+
+# WORKING DIRECTORY:
 # Each table must be loaded with a path. ROOT is the default
 # folder. If a table is created with another path, e.g.:
 # working_dir, then tablite.hdf5 and /pages must be present.
@@ -22,7 +64,7 @@ import pathlib, os, tempfile
 # │       ├───12
 # │       ├───...
 # │       └───n
-# ├───pages           The pages folder organise all commonly
+# ├───tablite         The pages folder organise all commonly
 # │   ├───1.h5        blocking read/writes.
 # │   ├───2.h5
 # │   ├───...
@@ -31,26 +73,6 @@ import pathlib, os, tempfile
 # The /table refers to columns.
 # Columns refer to pages
 # pages hold data.
-
-H5_FILENAME = 'tablite.h5'
-H5_PAGES_NAME = 'pages'
-H5_DIR = pathlib.Path(tempfile.gettempdir()) / "tablite"
-H5_STORAGE = H5_DIR / H5_FILENAME
-if not H5_DIR.exists():
-    H5_DIR.mkdir()
-# to overwrite first import the config class:
-# >>> from tablite.config import Config
-# >>> Config.H5_STORAGE = /a/new/directory
-# Every new table will used this path.
-
-H5_PAGES = H5_DIR / 'pages'
-if not H5_PAGES.exists():
-    H5_PAGES.mkdir()
-
-H5_PAGE_SIZE = 1_000_000  # sets the page size limit.
-H5_ENCODING = 'UTF-8'  # sets the page encoding when using bytes
-SINGLE_PROCESSING_LIMIT = 1_000_000  # when the number of fields (rows x columns) 
-# exceed this value, multiprocessing is used.
 
 
 # EXPORT - An exported tablite table is a simple lz4 compressed folder. Why LZ4?
@@ -84,6 +106,11 @@ SINGLE_PROCESSING_LIMIT = 1_000_000  # when the number of fields (rows x columns
 TEMPDIR = pathlib.Path(tempfile.gettempdir()) / 'tablite-tmp'
 if not TEMPDIR.exists():
     TEMPDIR.mkdir()
+
+H5_PAGE_SIZE = 1_000_000  # sets the page size limit.
+H5_ENCODING = 'UTF-8'  # sets the page encoding when using bytes
+SINGLE_PROCESSING_LIMIT = 1_000_000  # when the number of fields (rows x columns) 
+# exceed this value, multiprocessing is used.
 
 
 
