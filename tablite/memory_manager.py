@@ -16,13 +16,24 @@ DIGITS = set(digits)
 import h5py  #https://stackoverflow.com/questions/27710245/is-there-an-analysis-speed-or-memory-usage-advantage-to-using-hdf5-for-large-arr?rq=1  
 import numpy as np
 
-from tablite.config import H5_STORAGE, H5_PAGE_SIZE, H5_ENCODING, H5_FILENAME, H5_PAGES_NAME
+from tablite.config import H5_PAGE_SIZE, H5_ENCODING  # page settings.
+from tablite.config import H5_INDEX_FILE, H5_DATA_DIR  # tablite.hdf5 and page folder.
+from tablite.config import H5_DATA_DIR_NAME, H5_FILENAME  
+
+# TODO remove asserts below:
+assert isinstance(H5_INDEX_FILE, pathlib.Path)    
+assert H5_INDEX_FILE.is_file() 
+assert H5_INDEX_FILE.exists()
+assert isinstance(H5_DATA_DIR, pathlib.Path) 
+assert H5_DATA_DIR.is_dir()
+assert H5_DATA_DIR.exists()
+
 from tablite.utils import intercept
 from tablite.datatypes import DataTypes,numpy_types
 
 READONLY = 'r'   # r  Readonly, file must exist (default)
 READWRITE = 'r+' # r+ Read/write, file must exist
-TRUNCATE = 'w'   # w  Create file, truncate if exists
+CREATE = 'w'   # w  Create file, truncate if exists
 #                x    Create file, fail if exists
 #                a    Read/write if exists, create otherwise
 TIMEOUT = 10*60 * 1000  # maximum msec tolerance waiting for OS to release hdf5 write lock
@@ -55,11 +66,11 @@ def timeout(func):
     return wrapper
 
 
-def new_id(path, group):
+def new_id(group):
     if group not in {'/page', '/column', '/table'}:
         raise ValueError(f"expected group to be /page, /column or /table. Not {group}")
 
-    with h5py.File(path, READWRITE) as h5:
+    with h5py.File(H5_INDEX_FILE, READWRITE) as h5:
         if group not in h5.keys():
             raise TypeError("h5 storage has not been setup correctly.")  
         
@@ -67,33 +78,9 @@ def new_id(path, group):
         dset.attrs['pid'] = pid = dset.attrs.get('pid', 0) + 1
         return str(pid)
 
-@lru_cache()
-def check_path(path):
-    if not isinstance(path, pathlib.Path):
-            path = pathlib.Path(path)
-    if not path.is_file():
-        raise TypeError()
-    if not path.name.endswith('.h5'):
-        raise TypeError()
-    
-    if not path.parent.exists():  # create it.
-        log.info(f"creating tablite directory on {path}")
-        path.mkdir()
-    
-    if not (path.parent / H5_PAGES_NAME).exists():
-        (path.parent / H5_PAGES_NAME).mkdir()
 
-    with h5py.File(path, READWRITE) as h5:
-        for group in ['/table', '/column', 'page']:
-            if group not in h5.keys():
-                h5.create_group(group)
-    
-    
-    return path
-
-
-def create_table(path, key=None, save=False, config=None, columns=None):
-    with h5py.File(path, READWRITE) as h5:
+def create_table(key=None, save=False, config=None, columns=None):
+    with h5py.File(H5_INDEX_FILE, READWRITE) as h5:
         if key is None:
             key = new_id('/table')
         dset = h5.create_dataset(name=f"/table/{key}", dtype=h5py.Empty('f'))
@@ -108,14 +95,14 @@ def create_table(path, key=None, save=False, config=None, columns=None):
         dset.attrs['columns'] = json.dumps(columns)  
         return key
 
-def set_saved_flag(path, key, value):
-    with h5py.File(path, READWRITE) as h5:
+def set_saved_flag(key, value):
+    with h5py.File(H5_INDEX_FILE, READWRITE) as h5:
         dset = h5[f"/table/{key}"]
         dset.attrs['saved'] = value
 
 
-def delete_table(path, key):        
-    with h5py.File(path, READWRITE) as h5:
+def delete_table(key):        
+    with h5py.File(H5_INDEX_FILE, READWRITE) as h5:
         group = f"/table/{key}"
         dset = h5[group]
         saved_flag = dset.attrs['saved']
@@ -124,8 +111,8 @@ def delete_table(path, key):
         del h5[group]
 
 
-def create_column_reference(path, table_key, column_name, column_key):  # /column/{key}
-    with h5py.File(path, READWRITE) as h5:
+def create_column_reference(table_key, column_name, column_key):  # /column/{key}
+    with h5py.File(H5_INDEX_FILE, READWRITE) as h5:
         table_group = f"/table/{table_key}"
         dset = h5[table_group]  
         columns = json.loads(dset.attrs['columns'])
@@ -133,9 +120,9 @@ def create_column_reference(path, table_key, column_name, column_key):  # /colum
         dset.attrs['columns'] = json.dumps(columns) 
 
 
-def get_pages(path, column_key):
+def get_pages(column_key):
     group = f"/column/{column_key}"
-    with h5py.File(path, READONLY) as h5:
+    with h5py.File(H5_INDEX_FILE, READONLY) as h5:
         if group not in h5:
             return Pages()
         else:
@@ -146,20 +133,20 @@ def get_pages(path, column_key):
             return loaded_pages
 
 
-def del_page(path, page):
+def del_page(page):
     global REF_COUNTS
-    with h5py.File(path, READWRITE) as h5:
-        if REF_COUNTS[page.group]==0:
-            dset = h5[page.group]
-            if dset.attrs['datatype'] == 'typearray':
-                del h5[f"{page.group}_types"]
-            del h5[page.group]        
-            del REF_COUNTS[page.group]
+    if REF_COUNTS[page.group]!=0:
+        raise ValueError("global ref counts is not zero")
+    
+    (H5_DATA_DIR / f"{page.group}.h5").unlink()
+    del REF_COUNTS[page.group]
+
+            
 
 
-def delete_column_reference(path, table_key, column_name, column_key):
+def delete_column_reference(table_key, column_name, column_key):
     global REF_COUNTS
-    with h5py.File(path, READWRITE) as h5:
+    with h5py.File(H5_INDEX_FILE, READWRITE) as h5:
         dset = h5[f"/table/{table_key}"]
         saved_flag = dset.attrs['saved']
         if saved_flag:
@@ -170,36 +157,38 @@ def delete_column_reference(path, table_key, column_name, column_key):
             del columns[column_name] 
         dset.attrs['columns'] = json.dumps(columns)       
 
-        pages = get_pages(path, column_key)
+        pages = get_pages(column_key)
         del h5[f"/column/{column_key}"]  # deletes the virtual dataset.
         
         for page in pages:
             REF_COUNTS[page.group] -= 1
             if REF_COUNTS[page.group] == 0:
-                del_page(path, page)
+                del_page(page)
 
 
-def reset_storage(path=None):
-    if path is None:
-        path = H5_STORAGE 
+def reset_storage():
     log.info(f"{getpid()} resetting storage.")
-    with h5py.File(path, TRUNCATE) as h5:
+    with h5py.File(H5_INDEX_FILE, CREATE) as h5:
         assert list(h5.keys()) == []
-    time.sleep(1)  # let the OS flush the write outbuffer.
+    with h5py.File(H5_INDEX_FILE, 'w') as h5:
+        h5.create_group('/table')
+        h5.create_group('/column')
+        h5.create_group('/page')
+    for file in H5_DATA_DIR.iterdir():
+        file.unlink()
+    time.sleep(0.2)  # let the OS flush the write outbuffer.
 
 
-def get_imported_tables(path):
+def get_imported_tables():
     """
     returns dict with table key and json of import config
     """
-    if not isinstance(path, pathlib.Path): 
+    if not isinstance(H5_INDEX_FILE, pathlib.Path): 
         raise NotADirectoryError()
-    if not (path / H5_FILENAME).exits():
-        raise FileNotFoundError(f"{H5_FILENAME} not found in {path}")
     configs = {}
-    with h5py.File(path, READONLY) as h5:
-        if "/table" not in h5.keys():
-            raise ValueError("/table has not been initiated.")
+    with h5py.File(H5_INDEX_FILE, READONLY) as h5:
+        # if "/table" not in h5.keys():
+        #     raise ValueError("/table has not been initiated.")
         for table_key in h5["/table"].keys():
             dset = h5[f"/table/{table_key}"]
             config = dset.attrs.get('config',None)
@@ -208,34 +197,34 @@ def get_imported_tables(path):
     return configs
 
 
-def set_config(path, table_key, config):
+def set_config(table_key, config):
     """ 
     method used to set config after table creation.
     """  # used by Table.import_file(...) at the end of the import.
     if not isinstance(config, str):
         raise TypeError(f"not a string: {config}")
     group = f"/table/{table_key}"
-    with h5py.File(path, READWRITE) as h5:
+    with h5py.File(H5_INDEX_FILE, READWRITE) as h5:
         dset = h5[group]
         dset.attrs['config'] = config
 
 
-def load_column_attrs(path, column_key):
+def load_column_attrs(column_key):
     group = f"/column/{column_key}"
-    with h5py.File(path, READONLY) as h5:
+    with h5py.File(H5_INDEX_FILE, READONLY) as h5:
         dset = h5[group]
         page_groups = json.loads(dset.attrs['pages'])
         length = dset.attrs['length']
         return length, page_groups
 
 
-def get_data(path, column_key, item):
+def get_data(column_key, item):
     group = f"/column/{column_key}"
 
     if not isinstance(item, (int,slice)):
         raise TypeError(f'{type(item)} is not slice')
     
-    with h5py.File(path, READONLY) as h5:
+    with h5py.File(H5_INDEX_FILE, READONLY) as h5:
         if group not in h5:
             return np.array([])
         dset = h5[group]
@@ -246,7 +235,7 @@ def get_data(path, column_key, item):
         item_range = range(*item.indices(dset.attrs['length']))
         
         start,end = 0,0
-        pages = get_pages(path, column_key)
+        pages = get_pages(column_key)
         for page in pages:  # loaded Pages
             start = end
             end += len(page)
@@ -260,7 +249,7 @@ def get_data(path, column_key, item):
         return np.concatenate(arrays, dtype=dtype)
 
 
-def create_virtual_dataset(path, column_key, pages_before, pages_after):
+def create_virtual_dataset(column_key, pages_before, pages_after):
     """ The consumer API for Columns to create, update and delete datasets."""
     global REF_COUNTS
     if not isinstance(pages_before,Pages):
@@ -268,7 +257,7 @@ def create_virtual_dataset(path, column_key, pages_before, pages_after):
     if not isinstance(pages_after, Pages):
         raise TypeError("expected Pages.")
             
-    with h5py.File(path, READWRITE) as h5:
+    with h5py.File(H5_INDEX_FILE, READWRITE) as h5:
         # 1. adjust ref count by adding first, then remove, as this prevents ref count < 1.
         all_pages = pages_before + pages_after
         assert isinstance(all_pages, Pages)
@@ -280,7 +269,7 @@ def create_virtual_dataset(path, column_key, pages_before, pages_after):
         for page in pages_before:
             REF_COUNTS[page.group] -= 1
             if REF_COUNTS[page.group] == 0:
-                del_page(path, page)
+                del_page(page)
 
         group = f"/column/{column_key}"
         if group in h5:
@@ -299,11 +288,11 @@ def get_ref_count(page):
 
 
 @timeout
-def mp_get_columns(table_path, table_key):
+def mp_get_columns(table_key):
     """
     multi processing helper for getting column names and keys from an existing table.
     """
-    with h5py.File(table_path, READONLY) as h5:
+    with h5py.File(H5_INDEX_FILE, READONLY) as h5:
         group = f"/table/{table_key}"
         dset = h5[group]
         columns = json.loads(dset.attrs['columns'])
@@ -311,26 +300,26 @@ def mp_get_columns(table_path, table_key):
         return columns
 
 @timeout
-def mp_write_column(path, values, column_key=None):  # for column
+def mp_write_column(values, column_key=None):  # for column
     """
     multi processing helper for writing column data.
     """
-    with h5py.File(path, READWRITE) as h5:
+    with h5py.File(H5_INDEX_FILE, READWRITE) as h5:
         new_page = Page(values)
         if not column_key:
-            column_key = new_id(path, '/column')
+            column_key = new_id('/column')
         dset = h5.create_dataset(name=f'/column/{column_key}', dtype=h5py.Empty('f'))
         dset.attrs['pages'] = json.dumps([new_page.group])
         dset.attrs['length'] = len(new_page)
         return column_key
 
 @timeout
-def mp_write_table(path, table_key, columns):
+def mp_write_table(table_key, columns):
     """
     multi processing helper for writing table data.
     """
     assert isinstance(columns, dict)
-    with h5py.File(path, 'r+') as h5:
+    with h5py.File(H5_INDEX_FILE, 'r+') as h5:
         dset = h5.create_dataset(name=f"/table/{table_key}", dtype=h5py.Empty('f'))
         dset.attrs['columns'] = json.dumps(columns)  
         dset.attrs['saved'] = True  # delete control resides with __main__
@@ -475,15 +464,6 @@ class GenericPage(object):
     # dt = np.dtype('U25')  # 25-character string
    
     @classmethod
-    def new_id(cls):
-        with h5py.File(H5_STORAGE, READWRITE) as h5:
-            if '/page' not in h5.keys():
-                h5.create_group('/page')
-            dset = h5['/page']
-            dset.attrs['pid'] = pid = dset.attrs.get('pid', 0) + 1
-            return pid
-
-    @classmethod
     def layout(cls, pages):
         """ 
         finds the common datatype 
@@ -515,12 +495,14 @@ class GenericPage(object):
         return dtype, shape
 
     @classmethod
-    def load(cls, group):
+    def load(cls, key):
         """
         loads an existing group.
         """
-        with h5py.File(H5_STORAGE, READONLY) as h5:
-            dset = h5[group]
+        path = H5_DATA_DIR / f"{key}.h5"
+
+        with h5py.File(path, READONLY) as h5:
+            dset = h5[key]
             page_type = dset.attrs[cls._page_type]
             
             if not isinstance(page_type,str):
@@ -530,7 +512,7 @@ class GenericPage(object):
             if pg_class is None:
                 raise TypeError(f"page type not recognised: {page_type}")
       
-            page = pg_class(group)
+            page = pg_class(key)
             page.stored_datatype = dset.dtype
             page.original_datatype = dset.attrs[cls._datatype]
             page._len = dset.attrs.get(cls._length, dset.len())
@@ -544,7 +526,7 @@ class GenericPage(object):
             for v in data:
                 types[type(v)] += 1
 
-            if len(types)>1 or type(None) in types:
+            if len(types) > 1 or type(None) in types:
                 data = np.array(data, dtype='O')
             else:
                 data = np.array(data)  # str, int, float
@@ -566,33 +548,29 @@ class GenericPage(object):
         else:
             raise NotImplementedError(f"method missing for {data.dtype.char}")
 
-        group = f"/page/{cls.new_id()}"
-        pg = pg_cls(group,data)
+        pg = pg_cls(key=new_id('/page'), data=data)
         return pg
     
-    def __init__(self, group):        
-        if not group.startswith('/page'):
-            raise ValueError
-        
+    def __init__(self, key):
         self.encoding = H5_ENCODING
-        self.path = H5_STORAGE
-        self.group = group
+        self.path = H5_DATA_DIR / f"{key}.h5"
+        self.key = key
 
         self.stored_datatype = None  # stored type
         self.original_datatype = None  # original type
         self._len = 0
     
     def __str__(self) -> str:
-        return f"{self.__class__.__name__} | {self.group} | {self.original_datatype} | {self.stored_datatype} | {self._len}"
+        return f"{self.__class__.__name__} | {self.key} | {self.original_datatype} | {self.stored_datatype} | {self._len}"
 
     def __hash__(self) -> int:
-        return hash(self.group)
+        return hash(self.key)
 
     def __repr__(self) -> str:
         return self.__str__()
 
     def __eq__(self, __o: object) -> bool:
-        return self.group == __o.group
+        return self.key == __o.key
 
     def __len__(self):
         return self._len
@@ -629,8 +607,8 @@ class GenericPage(object):
 
 
 class SimpleType(GenericPage):
-    def __init__(self, group, data=None):
-        super().__init__(group)
+    def __init__(self, key, data=None):
+        super().__init__(key)
         if data is not None:
             self.create(data)
     
@@ -643,10 +621,8 @@ class SimpleType(GenericPage):
         self.stored_datatype = data.dtype
         self.original_datatype = data.dtype.name
         
-        with h5py.File(self.path, READWRITE) as h5:
-            if self.group in h5:
-                raise ValueError("page already exists")
-            dset = h5.create_dataset(name=self.group, 
+        with h5py.File(self.path, CREATE) as h5:
+            dset = h5.create_dataset(name=self.key, 
                                      data=data,  
                                      dtype=data.dtype,  
                                      maxshape=(None,),  # the stored data is now extendible / resizeable.
@@ -662,12 +638,12 @@ class SimpleType(GenericPage):
             raise TypeError
 
         with h5py.File(self.path, READONLY) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             return dset[item]
 
     def __setitem__(self, keys, values):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             if isinstance(keys,int):
                 if isinstance(values, (list,tuple,np.ndarray)):
                     dset[keys] = values[0]
@@ -686,7 +662,7 @@ class SimpleType(GenericPage):
         
     def __delitem__(self, key):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             if isinstance(key,int):
                 del dset[key]
             elif isinstance(key, slice):
@@ -703,14 +679,14 @@ class SimpleType(GenericPage):
         # value must be np.ndarray and of same type as self.
         # this has been checked before this point, so I let h5py complain if there is something wrong.
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             dset.resize(dset.len() + len(value),axis=0)
             dset[-len(value):] = value
             self._len = len(dset)
 
     def insert(self, index, value):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             value = np.array([value], dtype=dset.dtype)
             data = dset[:]
             dset.resize(dset.len() + len(value), axis=0)
@@ -725,7 +701,7 @@ class SimpleType(GenericPage):
         if not isinstance(values, (list, tuple, np.ndarray)):
             raise ValueError(f".extend requires an iterable")
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
 
             if not isinstance(values, np.ndarray):
                 values = np.array(values, dtype=dset.dtype)
@@ -735,7 +711,7 @@ class SimpleType(GenericPage):
 
     def remove(self, value):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             result = np.where(dset == value)
             if result[0]:
                 ix = result[0][0]
@@ -749,7 +725,7 @@ class SimpleType(GenericPage):
     
     def remove_all(self, value):  # Column will never call this.
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             mask = (dset != value)
             if mask.any():
                 new = np.compress(mask, dset[:], axis=0)
@@ -761,7 +737,7 @@ class SimpleType(GenericPage):
 
     def pop(self, index):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             index = len(dset) + index if index < 0 else index
             if index > len(dset):
                 raise IndexError(f"{index} > len(dset)")
@@ -777,8 +753,8 @@ class SimpleType(GenericPage):
 
 
 class StringType(GenericPage):
-    def __init__(self, group, data=None):
-        super().__init__(group)
+    def __init__(self, key, data=None):
+        super().__init__(key)
         if data is not None:
             self.create(data)
 
@@ -788,11 +764,11 @@ class StringType(GenericPage):
         data = np.char.encode(data, encoding='utf-8')  
         self._len = len(data)
 
-        with h5py.File(self.path, READWRITE) as h5:
-            if self.group in h5:
+        with h5py.File(self.path, CREATE) as h5:
+            if self.key in h5:
                 raise ValueError("page already exists")
                 
-            dset = h5.create_dataset(name=self.group, 
+            dset = h5.create_dataset(name=self.key, 
                                      data=data,  # data is now HDF5 compatible.
                                      dtype=self.stored_datatype,  # the HDF5 stored dtype may require unpacking using dtypes if they are different.
                                      maxshape=(None,),  # the stored data is now extendible / resizeable.
@@ -808,7 +784,7 @@ class StringType(GenericPage):
             raise TypeError
         
         with h5py.File(self.path, READONLY) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             match = dset[item]
             encoding = dset.attrs['encoding']
             match = np.array( [v.decode(encoding) for v in match] )
@@ -816,7 +792,7 @@ class StringType(GenericPage):
 
     def __setitem__(self, keys, values):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             if isinstance(keys,int):
                 if isinstance(values, (list,tuple,np.ndarray)):
                     dset[keys] = values[0]
@@ -835,7 +811,7 @@ class StringType(GenericPage):
 
     def __delitem__(self, key):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             if isinstance(key,int):
                 del dset[key]
             elif isinstance(key, slice):
@@ -852,14 +828,14 @@ class StringType(GenericPage):
         # value must be np.ndarray and of same type as self.
         # this has been checked before this point, so I let h5py complain if there is something wrong.
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             dset.resize(dset.len() + len(value),axis=0)
             dset[-len(value):] = value.astype(bytes) # encoding to bytes is required.
             self._len = len(dset)
     
     def insert(self, index, value):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             value = np.array([value], dtype=dset.dtype)
             data = dset[:]
             dset.resize(dset.len() + len(value), axis=0)
@@ -872,14 +848,14 @@ class StringType(GenericPage):
 
     def extend(self, values):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             dset.resize(dset.len() + len(values),axis=0)
             dset[-len(values):] = np.array(values, dtype=str).astype(bytes) # encoding to bytes is required.
             self._len = len(dset)
     
     def remove(self, value):        
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             value = np.array(value, dtype=dset.dtype)[0]
             result = np.where(dset == value)
             if result:
@@ -894,7 +870,7 @@ class StringType(GenericPage):
     
     def remove_all(self, value):  # Column will never call this.
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             value = np.array(value, dtype=dset.dtype)[0]
             mask = (dset != value)
             if mask.any():
@@ -907,7 +883,7 @@ class StringType(GenericPage):
 
     def pop(self, index):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             index = len(dset) + index if index < 0 else index
             if index > len(dset):
                 raise IndexError(f"{index} > len(dset)")
@@ -922,9 +898,9 @@ class StringType(GenericPage):
 
 
 class MixedType(GenericPage):
-    def __init__(self, group, data=None):
-        super().__init__(group)
-        self.type_group = f"{self.group}{self._type_array_postfix}"
+    def __init__(self, key, data=None):
+        super().__init__(key)
+        self.type_group = f"{self.key}{self._type_array_postfix}"
         if data is not None:
             self.create(data)
     
@@ -940,12 +916,12 @@ class MixedType(GenericPage):
         
         self.stored_datatype = h5py.string_dtype(encoding=H5_ENCODING)  # type 'O'
 
-        with h5py.File(self.path, READWRITE) as h5:
-            if self.group in h5:
+        with h5py.File(self.path, CREATE) as h5:
+            if self.key in h5:
                 raise ValueError("page already exists")
             
             # dataset
-            dset = h5.create_dataset(name=self.group, 
+            dset = h5.create_dataset(name=self.key, 
                                      data=data,  # data is now HDF5 compatible.
                                      dtype=self.stored_datatype,  # the HDF5 stored dtype may require unpacking using dtypes if they are different.
                                      maxshape=(None,),  # the stored data is now extendible / resizeable.
@@ -969,10 +945,10 @@ class MixedType(GenericPage):
 
         with h5py.File(self.path, READONLY) as h5:
             # check if the slice is worth converting.
-            dset = h5[self.group]
+            dset = h5[self.key]
             match = dset[item]            
             
-            type_group = f"{self.group}{self._type_array_postfix}"
+            type_group = f"{self.key}{self._type_array_postfix}"
             type_array = h5[type_group][item]  # includes the page id
             type_functions = DataTypes.from_type_code
 
@@ -983,7 +959,7 @@ class MixedType(GenericPage):
         dtypes = DataTypes
         with h5py.File(self.path, READWRITE) as h5:
             if isinstance(keys, int):
-                dset1 = h5[self.group]
+                dset1 = h5[self.key]
                 dset1[keys] = dtypes.to_bytes(values)
 
                 dset2 = h5[self.type_group]
@@ -992,7 +968,7 @@ class MixedType(GenericPage):
 
             elif isinstance(keys, slice):
                 dt = DataTypes
-                g1 = [self.group, self.type_group]
+                g1 = [self.key, self.type_group]
                 g2 = [dt.bytes_functions, dt.type_code]
 
                 for grp,f in zip(g1,g2):
@@ -1011,13 +987,13 @@ class MixedType(GenericPage):
         with h5py.File(self.path, READWRITE) as h5:
             
             if isinstance(key,int):
-                for grp in [self.group, self.type_group]:
+                for grp in [self.key, self.type_group]:
                     dset = h5[grp]
                     del dset[key]
                     self._len -= 1
                 
             elif isinstance(key, slice):
-                for grp in [self.group, self.type_group]:
+                for grp in [self.key, self.type_group]:
                     dset = h5[grp]
                     data = dset[:]  # shallow copy
                     del data[key]  # update copy
@@ -1039,7 +1015,7 @@ class MixedType(GenericPage):
         
         with h5py.File(self.path, READWRITE) as h5:
             # update dataset
-            dset = h5[self.group]
+            dset = h5[self.key]
             dset.resize(dset.len() + len(value),axis=0)
             dset[-len(value):] = data
             
@@ -1053,7 +1029,7 @@ class MixedType(GenericPage):
 
     def insert(self, index, value):
         dt = DataTypes
-        g1 = [self.group, self.type_group]
+        g1 = [self.key, self.type_group]
         g2 = [dt.bytes_functions(value), dt.type_code(value) ]
 
         with h5py.File(self.path, READWRITE) as h5:
@@ -1077,7 +1053,7 @@ class MixedType(GenericPage):
 
         with h5py.File(self.path, READWRITE) as h5:
             f = DataTypes.to_bytes
-            dset = h5[self.group]
+            dset = h5[self.key]
             data = np.array( [ f(v) for v in values ] )
             dset.resize(dset.len() + len(values), axis=0)
             dset[-len(values):] = data
@@ -1093,10 +1069,10 @@ class MixedType(GenericPage):
 
     def remove(self, value):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             result = np.where(dset == value)
             if result[0]:
-                for grp in [self.group, self.type_group]:
+                for grp in [self.key, self.type_group]:
                     dset = h5[grp]
                     ix = result[0][0]
                     data = dset[:]
@@ -1109,11 +1085,11 @@ class MixedType(GenericPage):
     
     def remove_all(self, value):  # Column will never call this.
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             value = np.array(value, dtype=dset.dtype)[0]
             mask = (dset != value)
             if mask.any():
-                for grp in [self.group, self.type_group]:
+                for grp in [self.key, self.type_group]:
                     dset = h5[grp]
                     new = np.compress(mask, dset[:], axis=0)
                     dset.resize(len(new), axis=0)
@@ -1124,11 +1100,11 @@ class MixedType(GenericPage):
 
     def pop(self, index):
         with h5py.File(self.path, READWRITE) as h5:
-            dset = h5[self.group]
+            dset = h5[self.key]
             index = len(dset) + index if index < 0 else index
             if index > len(dset):
                 raise IndexError(f"{index} > len(dset)")
-            for grp in [self.group, self.type_group]:
+            for grp in [self.key, self.type_group]:
                 dset = h5[grp]
                 data = dset[:]
                 dset.resize(len(dset)-1, axis=0)
@@ -1145,10 +1121,10 @@ class MixedType(GenericPage):
 
 
 class SparseType(GenericPage):
-    def __init__(self, group, data=None):
-        super().__init__(group)
-        self.type_group = f"{self.group}{self._type_array_postfix}"
-        self.index_group = f"{self.group}{self._index_array_postfix}"
+    def __init__(self, key, data=None):
+        super().__init__(key)
+        self.type_group = f"{self.key}{self._type_array_postfix}"
+        self.index_group = f"{self.key}{self._index_array_postfix}"
         if data is not None:
             self.create(data)
     
@@ -1171,12 +1147,12 @@ class SparseType(GenericPage):
 
         self.stored_datatype = h5py.string_dtype(encoding=H5_ENCODING)  # type 'O'
 
-        with h5py.File(self.path, READWRITE) as h5:
-            if self.group in h5:
+        with h5py.File(self.path, CREATE) as h5:
+            if self.key in h5:
                 raise ValueError("page already exists")
 
             # create dataset
-            dset = h5.create_dataset(name=self.group, 
+            dset = h5.create_dataset(name=self.key, 
                                      data=byte_data, 
                                      dtype=self.stored_datatype, 
                                      maxshape=(None, ), 
@@ -1222,7 +1198,7 @@ class SparseType(GenericPage):
             default_value = type_functions(default_value, default_value_type_code)
 
             d = {}
-            for index, value, type_code in zip(h5[self.index_group], h5[self.group], h5[self.type_group]):
+            for index, value, type_code in zip(h5[self.index_group], h5[self.key], h5[self.type_group]):
                 if index < match_range.start:
                     continue
 
@@ -1293,8 +1269,8 @@ class Page(object):
                            Page   -- consumer api.
     """
     @classmethod
-    def load(cls, group):
-        return Page(GenericPage.load(group))
+    def load(cls, key):
+        return Page(GenericPage.load(key))
 
     @classmethod
     def layout(cls, pages):
@@ -1308,7 +1284,7 @@ class Page(object):
     
     @property
     def group(self):
-        return self._page.group
+        return self._page.key
 
     @property
     def original_datatype(self):

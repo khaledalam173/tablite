@@ -86,7 +86,7 @@ def test02_verify_garbage_collection():
 
     del table4
     del table5
-    import gc; gc.collect()  # pytest keeps reference to table4 & 5, so gc must be invoked explicitly.
+    gc.collect()  # pytest keeps reference to table4 & 5, so gc must be invoked explicitly.
     # alternatively the explicit call to .__del__ could be made.
     # table4.__del__()  
     # table5.__del__()
@@ -512,7 +512,5 @@ def test07_verify_gc():
 
     gc.collect()
     print("ok")
-
-
 
 

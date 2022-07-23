@@ -16,12 +16,12 @@ def set_working_dir(path):
     if not path.is_dir():
         raise NotADirectoryError()
     
-    global _H5_FILENAME
+    global H5_FILENAME
     global H5_INDEX_FILE
     global H5_DATA_DIR
     global H5_WORKING_DIR
-    H5_INDEX_FILE = path / _H5_FILENAME     # E.g. tempdir/tablite.h5
-    H5_DATA_DIR = path / _H5_DATA_DIR_NAME  # E.g. tempdir/tablite
+    H5_INDEX_FILE = path / H5_FILENAME     # E.g. tempdir/tablite.h5
+    H5_DATA_DIR = path / H5_DATA_DIR_NAME  # E.g. tempdir/tablite
 
     if not H5_DATA_DIR.exists():
         H5_DATA_DIR.mkdir()
@@ -37,11 +37,10 @@ def set_working_dir(path):
 H5_DATA_DIR = ""
 H5_INDEX_FILE = ""
 
-_H5_FILENAME = 'tablite.h5'
-_H5_DATA_DIR_NAME = 'tablite'
+H5_FILENAME = 'tablite.h5'
+H5_DATA_DIR_NAME = 'tablite'
 
 set_working_dir(path=pathlib.Path(tempfile.gettempdir()))
-
 
 # WORKING DIRECTORY:
 # Each table must be loaded with a path. ROOT is the default
@@ -73,32 +72,6 @@ set_working_dir(path=pathlib.Path(tempfile.gettempdir()))
 # The /table refers to columns.
 # Columns refer to pages
 # pages hold data.
-
-
-# EXPORT - An exported tablite table is a simple lz4 compressed folder. Why LZ4?
-# This is why: https://gist.github.com/root-11/021b63697e7389e93ecd92abe3cdd806#file-compression_benchmark-py
-#
-# somename.lz4
-# ├───tablite.hdf5
-# │   ├───/table
-# │   │   ├───1
-# │   │   ├───2
-# │   │   ├───...
-# │   │   └───n
-# │   └───/column
-# │       ├───11
-# │       ├───12
-# │       ├───...
-# │       └───n
-# ├───pages
-# │   ├───1.h5
-# │   ├───2.h5
-# │   ├───...
-# │   └───n.h5
-
-
-# IMPORT - As Table.path points to the root, which is a dir - it's readwriteable.
-# nothing else needs to be done.
 
 # TEMPORARY FILES
 # So far only the file_reader requires a dir for splitting files for import.
