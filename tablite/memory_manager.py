@@ -4,7 +4,6 @@ import json
 import functools
 import logging
 import pathlib
-from functools import lru_cache
 
 log = logging.getLogger(__name__)
 
