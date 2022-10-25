@@ -1,8 +1,5 @@
 # Frequently Asked Questions
 
-
-# FAQ
-
 | Question | Answer |
 |:---|:---|
 |I'm not in a notebook. Is there a nice way to view tables?| Yes. `table.show()` prints the ascii version |
