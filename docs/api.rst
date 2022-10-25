@@ -1,7 +1,7 @@
 API Reference
 =============
 
-.. automodule:: .tablite
+.. automodule:: tablite
     :members:
 
 

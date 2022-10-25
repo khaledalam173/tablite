@@ -9,5 +9,5 @@ chapters:
 - file: tutorial
 - file: internals
 - file: faq
-- file: tablite
+- file: api
 - file: tablite_and_pandas
